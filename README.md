@@ -1,8 +1,4 @@
-Proyek ini mendemonstrasikan arsitektur polyglot (multi-bahasa) untuk membangun node jaringan Peer-to-Peer sederhana dengan fokus pada keamanan, efisiensi, dan orkestrasi sistem.
-
-
-
-🛠️ Persyaratan Sistem
+Persyaratan Sistem
 Pastikan Anda memiliki tools berikut terinstal di sistem operasi (Linux/macOS direkomendasikan):
 
 1. G++ Compiler 
