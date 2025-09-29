@@ -35,5 +35,3 @@ Pastikan Kunci Rahasia (default: kunci-rahasia-p2p) sama dengan yang digunakan C
 Ketik pesan dan klik "Enkripsi & Kirim".
 
 Logika Java akan melakukan enkripsi, menghitung hash, dan mensimulasikan transmisi ke Node C++ yang berjalan.
-
-Dengan file-file ini, repositori GitHub Anda akan terstruktur, memiliki dokumentasi yang jelas, dan siap untuk digunakan serta dikembangkan oleh kontributor lain.
