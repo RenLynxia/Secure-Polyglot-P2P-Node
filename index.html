@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Node Controller (Kriptografi & Key Management)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Firebase Imports ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, query, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Globals ---
+        let db;
+        let auth;
+        let userId = 'unknown';
+        let sharedSecretKey = 'kunci-rahasia-p2p'; // Default Key
+
+        // --- Perbaikan KESALAHAN INISIALISASI: Fallback Konfigurasi ---
+        const isCanvasEnvironment = typeof __firebase_config !== 'undefined' && __firebase_config !== '{}';
+        const appId = isCanvasEnvironment ? __app_id : 'sp2pn-local-test-id';
+
+        let firebaseConfig;
+
+        if (isCanvasEnvironment) {
+            // Lingkungan Canvas/Production: Gunakan konfigurasi yang disediakan
+            firebaseConfig = JSON.parse(__firebase_config);
+        } else {
+            // Lingkungan Lokal/Development: Gunakan konfigurasi mock.
+            // PENTING: Untuk menjalankan ini, pastikan Anda menggunakan server lokal (python3 -m http.server)
+            console.warn("MENGGUNAKAN KONFIGURASI FIREBASE MOCK. Database tidak akan berfungsi jika Anda tidak mengganti ini dengan config Anda sendiri.");
+            firebaseConfig = {
+                apiKey: "mock-api-key",
+                authDomain: "mock-auth-domain",
+                projectId: "mock-project-id"
+            };
+        }
+        // --- Akhir Perbaikan Fallback ---
+
+        // --- P2P Configuration ---
+        const CppNodeHost = 'localhost';
+        const CppNodePort = 8081;
+
+        // --- Utility Functions ---
+
+        /** Mengambil path koleksi untuk log publik */
+        const getPublicLogPath = () => `/artifacts/${appId}/public/data/p2p_logs`;
+        /** Mengambil path dokumen untuk kunci rahasia */
+        const getKeyDocPath = () => `/artifacts/${appId}/public/data/config/secret_key`;
+
+        /** Enkripsi/Dekripsi XOR sederhana (Harus sesuai dengan C++!) */
+        function xorEncryptDecrypt(data, key) {
+            let output = '';
+            for (let i = 0; i < data.length; i++) {
+                output += String.fromCharCode(data.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+            }
+            return output;
+        }
+
+        /** Menghitung SHA-256 Hash dari string (Verifikasi Hash) */
+        async function sha256(message) {
+            const msgBuffer = new TextEncoder().encode(message);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            return hashHex;
+        }
+
+        /** Simulasi Komunikasi (Mengganti Socket Java) */
+        async function sendMessageToCppNode(encryptedMessage) {
+            console.log(`[Java Logic]: Mengirim data terenkripsi ke C++ Node (${CppNodeHost}:${CppNodePort})`);
+
+            try {
+                // Dalam lingkungan non-Canvas/lokal, fetch/socket ke localhost sering diblokir atau gagal
+                // Kita ganti ini dengan simulasi sukses untuk fokus pada Kriptografi dan Key Management
+                await new Promise(resolve => setTimeout(resolve, 500));
+
+                const encryptedResponse = "ACK: Pesan didekripsi & dienkripsi ulang (Simulasi)";
+                const decryptedResponse = xorEncryptDecrypt(encryptedResponse, sharedSecretKey);
+
+                console.log(`[Java Logic]: Respon Terenkripsi dari C++: ${encryptedResponse.substring(0, 30)}...`);
+                console.log(`[Java Logic]: Respon Didekripsi: ${decryptedResponse}`);
+                return decryptedResponse;
+
+            } catch (error) {
+                console.error("[Java Logic]: Gagal berkomunikasi dengan C++ Node (Simulasi Socket Gagal):", error);
+                return `ERR: Komunikasi C++ gagal - ${error.message}`;
+            }
+        }
+
+        /** Menyimpan riwayat pesan ke Firestore */
+        async function saveMessageLog(senderId, content, type, hash = null) {
+            if (!db || userId === 'unknown') return console.error("Firestore atau Auth belum siap.");
+
+            // NOTE: Kami akan menonaktifkan penulisan ke Firestore jika menggunakan konfigurasi MOCK
+            // agar tidak menyebabkan error di browser lokal.
+            if (!isCanvasEnvironment) {
+                 console.log(`[Firestore MOCK]: Log P2P: ${content} (WRITE BLOCKED IN LOCAL MOCK MODE)`);
+                 return;
+            }
+
+            const logRef = collection(db, getPublicLogPath());
+
+            try {
+                await setDoc(doc(logRef), {
+                    senderId: senderId,
+                    content: content,
+                    type: type,
+                    hash: hash, // Hash untuk Verifikasi Python
+                    timestamp: serverTimestamp()
+                });
+                console.log(`[Firestore]: Log pesan berhasil disimpan.`);
+            } catch (e) {
+                console.error("Gagal menambahkan log pesan ke Firestore: ", e);
+            }
+        }
+
+        /** Manajemen Kunci: Memuat Kunci dari Firestore (Persistensi Java) */
+        async function loadSecretKey() {
+            if (!db) return;
+
+            // NOTE: Kami akan menonaktifkan pembacaan Firestore jika menggunakan konfigurasi MOCK
+            if (!isCanvasEnvironment) {
+                document.getElementById('secret-key-input').value = sharedSecretKey;
+                document.getElementById('key-status').textContent = 'Kunci Default digunakan (MODE LOKAL). Persistensi Firestore non-aktif.';
+                console.log(`[Key Manager MOCK]: Kunci Rahasia Dimuat: ${sharedSecretKey}`);
+                return;
+            }
+
+            const keyDocRef = doc(db, getKeyDocPath());
+
+            try {
+                const docSnap = await getDoc(keyDocRef);
+                if (docSnap.exists()) {
+                    sharedSecretKey = docSnap.data().key;
+                    document.getElementById('secret-key-input').value = sharedSecretKey;
+                    document.getElementById('key-status').textContent = 'Kunci dimuat dari Firestore.';
+                } else {
+                    await saveSecretKey(sharedSecretKey); // Simpan default jika belum ada
+                    document.getElementById('key-status').textContent = 'Kunci Default disimpan ke Firestore.';
+                }
+                console.log(`[Key Manager]: Kunci Rahasia Dimuat: ${sharedSecretKey}`);
+            } catch (e) {
+                console.error("Gagal memuat kunci rahasia:", e);
+                document.getElementById('key-status').textContent = 'ERROR: Gagal memuat kunci.';
+            }
+        }
+
+        /** Manajemen Kunci: Menyimpan Kunci ke Firestore */
+        async function saveSecretKey(key) {
+            if (!db) return;
+
+            if (!isCanvasEnvironment) {
+                 sharedSecretKey = key;
+                 document.getElementById('key-status').textContent = 'Kunci Diperbarui Secara LOKAL. Firestore non-aktif.';
+                 console.log(`[Key Manager MOCK]: Kunci Rahasia Diperbarui: ${sharedSecretKey}`);
+                 return;
+            }
+
+            const keyDocRef = doc(db, getKeyDocPath());
+            try {
+                await setDoc(keyDocRef, { key: key });
+                sharedSecretKey = key;
+                document.getElementById('key-status').textContent = 'Kunci Berhasil Disimpan & Diperbarui!';
+                console.log(`[Key Manager]: Kunci Rahasia Diperbarui: ${sharedSecretKey}`);
+            } catch (e) {
+                console.error("Gagal menyimpan kunci rahasia:", e);
+                document.getElementById('key-status').textContent = 'ERROR: Gagal menyimpan kunci.';
+            }
+        }
+
+        /** Inisialisasi Firebase dan Auth */
+        async function initializeFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // --- Penanganan Otentikasi Lokal vs Canvas ---
+                if (isCanvasEnvironment) {
+                    if (typeof __initial_auth_token !== 'undefined') {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } else {
+                     // Mode Lokal: Otentikasi Anonim Paksa
+                     await signInAnonymously(auth);
+                }
+
+                userId = auth.currentUser?.uid || crypto.randomUUID();
+                document.getElementById('user-id-display').textContent = `User ID Node (Java Logic): ${userId}`;
+
+                await loadSecretKey(); // Muat kunci setelah Auth siap
+                if (isCanvasEnvironment) {
+                    setupLogListener();
+                } else {
+                    document.getElementById('log-container').innerHTML = '<p class="text-gray-500 p-4 text-center bg-yellow-100 rounded-lg">Listener Log Firestore non-aktif dalam MODE LOKAL.</p>';
+                }
+
+                document.getElementById('status-message').textContent = 'Node Kriptografi Siap. Kunci Dimuat.';
+                document.getElementById('status-message').className = 'p-3 mb-4 text-sm font-medium text-white bg-green-600 rounded-lg shadow-md';
+
+
+            } catch (error) {
+                console.error("Gagal inisialisasi Firebase/Auth:", error);
+                document.getElementById('status-message').textContent = `ERROR: Gagal inisialisasi. Cek Konsol.`;
+                document.getElementById('status-message').className = 'p-3 mb-4 text-sm font-medium text-white bg-red-600 rounded-lg shadow-md';
+            }
+        }
+
+        /** Listener Real-Time untuk Log P2P Publik (Hanya di Canvas Environment) */
+        function setupLogListener() {
+            const logRef = collection(db, getPublicLogPath());
+            const logQuery = query(logRef);
+
+            onSnapshot(logQuery, (snapshot) => {
+                const logs = [];
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    logs.push({
+                        id: doc.id,
+                        ...data,
+                        timestamp: data.timestamp?.toDate ? data.timestamp.toDate() : new Date()
+                    });
+                });
+
+                logs.sort((a, b) => b.timestamp - a.timestamp);
+                renderLogs(logs);
+            }, (error) => {
+                console.error("Kesalahan saat mendengarkan Log P2P:", error);
+                document.getElementById('status-message').textContent = `ERROR: Listener log gagal. Cek Konsol.`;
+            });
+        }
+
+        /** Merender Log ke UI */
+        function renderLogs(logs) {
+            const logContainer = document.getElementById('log-container');
+            logContainer.innerHTML = '';
+
+            if (logs.length === 0) {
+                logContainer.innerHTML = '<p class="text-gray-500 p-4 text-center">Belum ada aktivitas P2P.</p>';
+                return;
+            }
+
+            logs.forEach(log => {
+                const logItem = document.createElement('div');
+                let colorClass = '';
+                let integrityStatus = '';
+
+                if (log.type === 'OUTGOING') {
+                    colorClass = 'bg-indigo-100 border-indigo-500';
+                    integrityStatus = log.hash ? `<span class="text-xs text-indigo-700 font-mono">Hash: ${log.hash.substring(0, 10)}...</span>` : '';
+                } else if (log.type === 'INCOMING') {
+                    colorClass = 'bg-teal-100 border-teal-500';
+                    integrityStatus = log.verification_status ?
+                        `<span class="text-xs font-bold ${log.verification_status === 'VERIFIED' ? 'text-green-600' : 'text-red-600'}">[${log.verification_status}]</span>` :
+                        '<span class="text-xs text-gray-500">[Belum Diverifikasi Python]</span>';
+                } else {
+                    colorClass = 'bg-gray-100 border-gray-400';
+                }
+
+                const timeStr = new Date(log.timestamp).toLocaleTimeString('id-ID');
+
+                logItem.className = `p-3 mb-2 rounded-lg border-l-4 shadow-sm text-sm ${colorClass}`;
+                logItem.innerHTML = `
+                    <div class="flex justify-between items-center">
+                        <div class="font-mono text-xs text-gray-600">${timeStr} | ${log.type} | Sender: ${log.senderId.substring(0, 8)}...</div>
+                        ${integrityStatus}
+                    </div>
+                    <div class="mt-1 font-medium text-gray-800">${log.content}</div>
+                `;
+                logContainer.appendChild(logItem);
+            });
+        }
+
+
+        // --- Event Handlers ---
+
+        document.getElementById('update-key-btn').addEventListener('click', () => {
+            const newKey = document.getElementById('secret-key-input').value.trim();
+            if (newKey) {
+                saveSecretKey(newKey);
+            }
+        });
+
+        document.getElementById('send-p2p-btn').addEventListener('click', async () => {
+            const messageInput = document.getElementById('message-input');
+            const rawMessage = messageInput.value.trim();
+            if (!rawMessage || !sharedSecretKey) {
+                 document.getElementById('status-message').textContent = 'ERROR: Pesan atau Kunci Rahasia kosong.';
+                 document.getElementById('status-message').className = 'p-3 mb-4 text-sm font-medium text-white bg-red-600 rounded-lg shadow-md';
+                 return;
+            }
+
+            // 1. Enkripsi pesan (Java Logic)
+            const encryptedMessage = xorEncryptDecrypt(rawMessage, sharedSecretKey);
+
+            // 2. Hitung Hash dari pesan terenkripsi (Verifikasi Integritas)
+            const messageHash = await sha256(encryptedMessage);
+
+            // 3. Log pesan keluar
+            await saveMessageLog(userId, `[ENCRYPTED] ${rawMessage}`, 'OUTGOING', messageHash);
+
+            // 4. Kirim pesan ENKRIPSI ke C++ Node (Simulasi Layer Jaringan)
+            const cppResponse = await sendMessageToCppNode(encryptedMessage);
+
+            // 5. Log respons dari C++
+            await saveMessageLog('System', `C++ Response: ${cppResponse}`, 'SYSTEM');
+
+            messageInput.value = ''; // Kosongkan input
+        });
+
+        // --- Initialization ---
+        window.onload = initializeFirebase;
+
+    </script>
+    <style>
+        .container {
+            max-width: 900px;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 p-4 min-h-screen">
+    <div class="container mx-auto">
+        <h1 class="text-3xl font-extrabold text-indigo-800 mb-2 border-b pb-2">Simple P2P Node (Kriptografi & Key Management)</h1>
+        <p id="user-id-display" class="text-sm font-mono text-gray-600 mb-4"></p>
+        <div id="status-message" class="p-3 mb-4 text-sm font-medium text-white bg-indigo-600 rounded-lg shadow-md">Memuat...</div>
+
+        <!-- 1. Manajemen Kunci (Java Persistensi Logic) -->
+        <div class="bg-white p-6 rounded-xl shadow-2xl mb-6 border border-indigo-200">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4 flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-2 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 7a2 2 0 012 2v5a2 2 0 01-2 2h-2m-2 4h4m-2 0V14m0 0v-4m-2 4h-4a2 2 0 01-2-2V9a2 2 0 012-2h2m-2 4h4" />
+                </svg>
+                A. Manajemen Kunci Enkripsi (Java $\rightarrow$ Firestore)
+            </h2>
+            <div class="flex space-x-3">
+                <input type="text" id="secret-key-input" placeholder="Masukkan Kunci Rahasia Bersama (Shared Secret Key)" class="flex-grow p-3 border border-gray-300 rounded-lg font-mono focus:ring-indigo-500 focus:border-indigo-500">
+                <button id="update-key-btn" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-200">
+                    Simpan Kunci
+                </button>
+            </div>
+            <p id="key-status" class="text-xs mt-2 text-gray-500">Kunci Default: kunci-rahasia-p2p. Pastikan kunci ini sama dengan yang digunakan C++!</p>
+        </div>
+
+        <!-- 2. Transmisi Terenkripsi (Java Logic) -->
+        <div class="bg-white p-6 rounded-xl shadow-2xl mb-6">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4 flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-2 text-teal-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.001 12.001 0 002.944 12c.04.101.07.202.10.301.27.915.666 1.767 1.157 2.536L12 21.057l7.796-6.195c.491-.769.887-1.621 1.157-2.536.03-.099.06-.2.1-.301a12.001 12.001 0 00-3.382-9.056z" />
+                </svg>
+                B. Kirim Pesan Terenkripsi (Java $\rightarrow$ C++ Soket)
+            </h2>
+            <div class="flex space-x-3">
+                <input type="text" id="message-input" placeholder="Ketik pesan P2P..." class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-teal-500 focus:border-teal-500">
+                <button id="send-p2p-btn" class="bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-200">
+                    Enkripsi & Kirim
+                </button>
+            </div>
+            <p class="text-xs mt-2 text-gray-500">Pesan akan dienkripsi oleh Logic Java, Hash dihitung, dan ditransmisikan ke C++ Node.</p>
+        </div>
+
+        <!-- 3. Log P2P Real-Time & Verifikasi (Python Simulation) -->
+        <div class="bg-white p-6 rounded-xl shadow-2xl">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4 flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-2 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+                </svg>
+                C. Log Aktivitas Jaringan & Verifikasi Hash
+            </h2>
+            <div id="log-container" class="space-y-2 max-h-96 overflow-y-auto border p-2 rounded-lg bg-gray-50">
+                <!-- Logs dimuat di sini oleh JavaScript/Java Logic -->
+            </div>
+        </div>
+    </div>
+</body>
+</html>
